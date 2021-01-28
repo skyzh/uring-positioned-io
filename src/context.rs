@@ -24,7 +24,7 @@ struct UringPollFuture {
 
 impl Future for UringPollFuture {
     type Output = io::Result<()>;
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         loop {
             match self.finish.try_recv() {
                 Err(TryRecvError::Empty) => {}
@@ -39,6 +39,7 @@ impl Future for UringPollFuture {
                     .send(entry.result())
                     .unwrap();
             } else {
+                cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
         }
@@ -82,8 +83,13 @@ impl<T: AsMut<[u8]>> UringReadFuture<T> {
             if let Err(_) = unsafe { self.ring.submission().push(entry) } {
                 return Poll::Pending;
             }
-            if let Err(err) = self.ring.submit() {
-                return Poll::Ready(Err(err));
+            match self.ring.submit() {
+                Ok(submitted) => {
+                    assert_eq!(submitted, 1);
+                }
+                Err(err) => {
+                    return Poll::Ready(Err(err));
+                }
             }
             self.submitted = true;
         }
