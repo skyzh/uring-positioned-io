@@ -1,3 +1,4 @@
+use futures::pin_mut;
 use io::ErrorKind;
 use io_uring::{opcode, types::Fixed, IoUring};
 use pin_project::pin_project;
@@ -28,8 +29,13 @@ impl Future for UringPollFuture {
                 Err(TryRecvError::Closed) | Ok(_) => return Poll::Ready(Ok(())),
             }
             // first, submit all requests
-            if let Err(err) = self.ring.submit() {
-                return Poll::Ready(Err(err));
+            match self.ring.submit() {
+                Ok(nr) => {
+                    if nr != 0 {
+                        // println!("{} submitted", nr);
+                    }
+                }
+                Err(err) => return Poll::Ready(Err(err)),
             }
             // then, polling completed requests
             if let Some(entry) = self.ring.completion().pop() {
@@ -54,6 +60,7 @@ pub struct UringReadFuture<T: AsMut<[u8]>> {
     buf: Option<T>,
     id: u32,
     offset: u64,
+    #[pin]
     rx: Receiver<i32>,
     submitted: bool,
     #[pin]
@@ -75,7 +82,7 @@ impl<T: AsMut<[u8]>> UringReadFuture<T> {
         }
     }
 
-    fn submit(self: &mut Pin<&mut Self>) -> Poll<io::Result<()>> {
+    fn submit(self: &mut Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.submitted {
             let buf_ptr = self.buf.as_mut().unwrap().as_mut();
             let ptr = buf_ptr.as_mut_ptr();
@@ -83,6 +90,7 @@ impl<T: AsMut<[u8]>> UringReadFuture<T> {
             let read_op = opcode::Read::new(Fixed(self.id), ptr, len).offset(self.offset as i64);
             let entry = read_op.build().user_data(&mut self.task as *mut _ as u64);
             if let Err(_) = unsafe { self.ring.submission().push(entry) } {
+                cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
             self.submitted = true;
@@ -91,24 +99,26 @@ impl<T: AsMut<[u8]>> UringReadFuture<T> {
         Poll::Ready(Ok(()))
     }
 
-    fn retrieve(self: &mut Pin<&mut Self>) -> Poll<io::Result<i32>> {
-        match self.rx.try_recv() {
-            Err(TryRecvError::Closed) => {
+    fn retrieve(self: &mut Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<i32>> {
+        let rx = &mut self.rx;
+        pin_mut!(rx);
+        match rx.poll(cx) {
+            Poll::Ready(Err(_)) => {
                 Poll::Ready(Err(io::Error::new(ErrorKind::Other, "failed to receive")))
             }
-            Err(TryRecvError::Empty) => Poll::Pending,
-            Ok(x) => Poll::Ready(Ok(x)),
+            Poll::Ready(Ok(x)) => Poll::Ready(Ok(x)),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl<T: AsMut<[u8]>> Future for UringReadFuture<T> {
     type Output = io::Result<(T, usize)>;
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let result = self.submit();
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let result = self.submit(cx);
 
         match result {
-            Poll::Ready(Ok(_)) => self.retrieve().map(|res| {
+            Poll::Ready(Ok(_)) => self.retrieve(cx).map(|res| {
                 res.and_then(|x| {
                     if x >= 0 {
                         Ok((self.buf.take().unwrap(), x as usize))

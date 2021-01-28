@@ -24,7 +24,7 @@ fn gen_hash(id: usize, block: usize) -> u64 {
 fn verify_buf(mut buf: &[u8], id: usize, block: usize) {
     let val = gen_hash(id, block);
     while buf.len() > 0 {
-        assert_eq!(buf.get_u64_le(), val);
+        assert_eq!(buf.get_u64(), val);
     }
 }
 
@@ -123,7 +123,7 @@ async fn main() -> io::Result<()> {
                 for block in 0..nb {
                     let val = gen_hash(id, block);
                     let mut buf = vec![];
-                    buf.put_u64_le(val);
+                    buf.put_u64(val);
                     for _ in 0..(4096 / buf.len()) {
                         writer.write(&buf)?;
                     }
@@ -164,15 +164,17 @@ async fn main() -> io::Result<()> {
                         Ok::<(), io::Error>(())
                     }
                 })
-                .buffer_unordered(con);
+                .buffered(con);
 
             let start = Instant::now();
             let mut cnt = 0;
             while let Some(result) = stream.next().await {
                 result?;
                 cnt += 1;
-                if cnt % 1000 == 0 {
-                    if Instant::now().duration_since(start).as_secs() >= time {
+                if cnt % 10000 == 0 {
+                    let elsped = Instant::now().duration_since(start).as_secs_f64();
+                    println!("{}, {}", elsped, cnt);
+                    if elsped >= time as f64 {
                         break;
                     }
                 }
