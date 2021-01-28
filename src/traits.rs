@@ -1,6 +1,7 @@
 use async_trait::async_trait;
+use std::io;
 
 #[async_trait]
-pub trait RandomAccessFile {
-    async fn read(offset: u64, n: usize);
+pub trait RandomAccessFiles {
+    async fn read(&self, id: u32, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
 }

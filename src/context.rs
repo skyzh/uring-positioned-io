@@ -1,5 +1,5 @@
 use io::ErrorKind;
-use io_uring::{cqueue, opcode, squeue, types::Fixed, IoUring};
+use io_uring::{opcode, types::Fixed, IoUring};
 use pin_project::pin_project;
 use std::fs::File;
 use std::future::Future;
@@ -8,10 +8,7 @@ use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::{
-    sync::oneshot::{channel, error::TryRecvError, Receiver, Sender},
-    task::JoinHandle,
-};
+use tokio::sync::oneshot::{channel, error::TryRecvError, Receiver, Sender};
 
 struct UringTask {
     complete: Option<Sender<i32>>,
@@ -30,6 +27,11 @@ impl Future for UringPollFuture {
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Closed) | Ok(_) => return Poll::Ready(Ok(())),
             }
+            // first, submit all requests
+            if let Err(err) = self.ring.submit() {
+                return Poll::Ready(Err(err));
+            }
+            // then, polling completed requests
             if let Some(entry) = self.ring.completion().pop() {
                 let uring_task: &mut UringTask = unsafe { std::mem::transmute(entry.user_data()) };
                 uring_task
@@ -82,14 +84,6 @@ impl<T: AsMut<[u8]>> UringReadFuture<T> {
             let entry = read_op.build().user_data(&mut self.task as *mut _ as u64);
             if let Err(_) = unsafe { self.ring.submission().push(entry) } {
                 return Poll::Pending;
-            }
-            match self.ring.submit() {
-                Ok(submitted) => {
-                    assert_eq!(submitted, 1);
-                }
-                Err(err) => {
-                    return Poll::Ready(Err(err));
-                }
             }
             self.submitted = true;
         }
@@ -164,6 +158,7 @@ impl Drop for UringContextInner {
     }
 }
 
+#[derive(Clone)]
 pub struct UringContext {
     inner: Arc<UringContextInner>,
 }
@@ -191,9 +186,10 @@ impl UringContext {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{self, Write};
+    use std::io::Write;
     use tempfile::tempfile;
 
     #[tokio::test]
@@ -210,7 +206,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read() {
-        let files = (0..25)
+        let files = (0..4)
             .map(|_| {
                 let mut file = tempfile().unwrap();
                 write!(file, "test").unwrap();
@@ -220,9 +216,13 @@ mod tests {
             .collect::<Vec<_>>();
         let context = UringContext::new(files, 256).unwrap();
         let mut buf = vec![0; 4];
-        context.read(0, 1, &mut buf).await.unwrap();
-        assert_eq!(buf, b"est\0");
-        context.read(0, 0, &mut buf).await.unwrap();
-        assert_eq!(buf, b"test");
+        for i in 0..4 {
+            let (_, sz) = context.read(i, 0, &mut buf).await.unwrap();
+            assert_eq!(&buf[..sz], b"test");
+            let (_, sz) = context.read(i, 1, &mut buf).await.unwrap();
+            assert_eq!(&buf[..sz], b"est");
+            let (_, sz) = context.read(i, 0, &mut buf).await.unwrap();
+            assert_eq!(&buf[..sz], b"test");
+        }
     }
 }
