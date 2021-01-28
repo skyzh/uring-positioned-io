@@ -5,6 +5,7 @@ mod uring;
 use bytes::{Buf, BufMut};
 use std::{collections::hash_map::DefaultHasher, time::Instant};
 use std::{fs::File, hash::Hasher, io, path::Path};
+use tokio::sync::oneshot::channel;
 use traits::RandomAccessFiles;
 
 use async_stream::stream;
@@ -142,6 +143,9 @@ async fn main() -> io::Result<()> {
                 .map(|name| File::open(name))
                 .collect::<io::Result<Vec<_>>>()?;
 
+            let (tx, mut rx) = channel();
+            let mut tx = Some(tx);
+
             let ctx = UringRandomAccessFiles::new(files, ql)?;
 
             let pos_stream = stream! {
@@ -149,6 +153,9 @@ async fn main() -> io::Result<()> {
                 loop {
                     let pos = (rng.gen_range(0..nf), rng.gen_range(0..nb));
                     yield pos;
+                    if let Ok(()) = rx.try_recv() {
+                        break;
+                    }
                 }
             };
 
@@ -164,7 +171,7 @@ async fn main() -> io::Result<()> {
                         Ok::<(), io::Error>(())
                     }
                 })
-                .buffered(con);
+                .buffer_unordered(con);
 
             let start = Instant::now();
             let mut cnt = 0;
@@ -175,7 +182,9 @@ async fn main() -> io::Result<()> {
                     let elsped = Instant::now().duration_since(start).as_secs_f64();
                     println!("{}, {}", elsped, cnt);
                     if elsped >= time as f64 {
-                        break;
+                        if let Some(tx) = tx.take() {
+                            tx.send(()).unwrap();
+                        };
                     }
                 }
             }

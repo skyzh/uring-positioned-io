@@ -56,7 +56,7 @@ impl Future for UringPollFuture {
 
 #[pin_project]
 pub struct UringReadFuture<T: AsMut<[u8]>> {
-    ring: Arc<io_uring::concurrent::IoUring>,
+    ctx: Arc<UringContextInner>,
     buf: Option<T>,
     id: u32,
     offset: u64,
@@ -68,11 +68,11 @@ pub struct UringReadFuture<T: AsMut<[u8]>> {
 }
 
 impl<T: AsMut<[u8]>> UringReadFuture<T> {
-    pub fn new(ring: Arc<io_uring::concurrent::IoUring>, buf: T, id: u32, offset: u64) -> Self {
+    fn new(ctx: Arc<UringContextInner>, buf: T, id: u32, offset: u64) -> Self {
         let (tx, rx) = channel();
         let task = UringTask { complete: Some(tx) };
         Self {
-            ring,
+            ctx,
             buf: Some(buf),
             id,
             offset,
@@ -89,7 +89,7 @@ impl<T: AsMut<[u8]>> UringReadFuture<T> {
             let len: u32 = buf_ptr.len() as _;
             let read_op = opcode::Read::new(Fixed(self.id), ptr, len).offset(self.offset as i64);
             let entry = read_op.build().user_data(&mut self.task as *mut _ as u64);
-            if let Err(_) = unsafe { self.ring.submission().push(entry) } {
+            if let Err(_) = unsafe { self.ctx.ring.submission().push(entry) } {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
@@ -162,9 +162,29 @@ impl Drop for UringContextInner {
     fn drop(&mut self) {
         let handle = self.handle.take().unwrap();
         let poll_finish = self.poll_finish.take().unwrap();
+        let nop_op = opcode::Nop::new();
+        let (tx, mut rx) = channel();
+        let mut task = Box::pin(UringTask { complete: Some(tx) });
+        let entry = nop_op
+            .build()
+            .user_data(task.as_mut().get_mut() as *mut _ as u64)
+            .flags(io_uring::squeue::Flags::IO_DRAIN);
+
+        let mut res = unsafe { self.ring.submission().push(entry) };
+        while let Err(entry) = res {
+            res = unsafe { self.ring.submission().push(entry) };
+        }
+
+        loop {
+            match rx.try_recv() {
+                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Closed) | Ok(_) => break,
+            }
+        }
+
         poll_finish.send(()).unwrap();
+
         handle.abort();
-        // TODO: wait until handle really aborts
     }
 }
 
@@ -192,7 +212,7 @@ impl UringContext {
     where
         T: AsMut<[u8]>,
     {
-        UringReadFuture::new(self.inner.ring.clone(), buf, id, offset)
+        UringReadFuture::new(self.inner.clone(), buf, id, offset)
     }
 }
 
