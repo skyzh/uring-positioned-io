@@ -15,6 +15,11 @@ impl UringRandomAccessFiles {
         let context = UringContext::new(files, nr)?;
         Ok(Self { context })
     }
+
+    pub async fn read_submit(&self, id: u32, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let (_, sz) = self.context.read_submit(id, offset, buf).await?;
+        Ok(sz)
+    }
 }
 
 #[async_trait]

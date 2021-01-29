@@ -1,4 +1,3 @@
-use futures::pin_mut;
 use io::ErrorKind;
 use io_uring::{opcode, types::Fixed, IoUring};
 use pin_project::pin_project;
@@ -23,21 +22,18 @@ struct UringPollFuture {
 impl Future for UringPollFuture {
     type Output = io::Result<()>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // first, submit all requests
+        if let Err(err) = self.ring.submit() {
+            return Poll::Ready(Err(err));
+        }
+
+        // then, polling completed requests
         loop {
             match self.finish.try_recv() {
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Closed) | Ok(_) => return Poll::Ready(Ok(())),
             }
-            // first, submit all requests
-            match self.ring.submit() {
-                Ok(nr) => {
-                    if nr != 0 {
-                        // println!("{} submitted", nr);
-                    }
-                }
-                Err(err) => return Poll::Ready(Err(err)),
-            }
-            // then, polling completed requests
+
             if let Some(entry) = self.ring.completion().pop() {
                 let uring_task: &mut UringTask = unsafe { std::mem::transmute(entry.user_data()) };
                 uring_task
@@ -65,10 +61,11 @@ pub struct UringReadFuture<T: AsMut<[u8]>> {
     submitted: bool,
     #[pin]
     task: UringTask,
+    per_submit: bool,
 }
 
 impl<T: AsMut<[u8]>> UringReadFuture<T> {
-    fn new(ctx: Arc<UringContextInner>, buf: T, id: u32, offset: u64) -> Self {
+    fn new(ctx: Arc<UringContextInner>, buf: T, id: u32, offset: u64, per_submit: bool) -> Self {
         let (tx, rx) = channel();
         let task = UringTask { complete: Some(tx) };
         Self {
@@ -79,29 +76,39 @@ impl<T: AsMut<[u8]>> UringReadFuture<T> {
             rx,
             task,
             submitted: false,
+            per_submit,
         }
     }
 
     fn submit(self: &mut Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if !self.submitted {
-            let buf_ptr = self.buf.as_mut().unwrap().as_mut();
+        let this = self.as_mut().project();
+        if !*this.submitted {
+            let buf_ptr = this.buf.as_mut().unwrap().as_mut();
             let ptr = buf_ptr.as_mut_ptr();
             let len: u32 = buf_ptr.len() as _;
-            let read_op = opcode::Read::new(Fixed(self.id), ptr, len).offset(self.offset as i64);
-            let entry = read_op.build().user_data(&mut self.task as *mut _ as u64);
-            if let Err(_) = unsafe { self.ctx.ring.submission().push(entry) } {
+            let read_op = opcode::Read::new(Fixed(*this.id), ptr, len).offset(*this.offset as i64);
+            let entry = read_op
+                .build()
+                .user_data(this.task.get_mut() as *mut _ as u64);
+            if let Err(_) = unsafe { this.ctx.ring.submission().push(entry) } {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
-            self.submitted = true;
+            *this.submitted = true;
+
+            if *this.per_submit {
+                if let Err(err) = this.ctx.ring.submit() {
+                    return Poll::Ready(Err(err));
+                }
+            }
         }
 
         Poll::Ready(Ok(()))
     }
 
     fn retrieve(self: &mut Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<i32>> {
-        let rx = &mut self.rx;
-        pin_mut!(rx);
+        let this = self.as_mut().project();
+        let rx = this.rx;
         match rx.poll(cx) {
             Poll::Ready(Err(_)) => {
                 Poll::Ready(Err(io::Error::new(ErrorKind::Other, "failed to receive")))
@@ -141,7 +148,7 @@ struct UringContextInner {
 }
 
 impl UringContextInner {
-    pub fn new(files: Vec<File>, nr: usize) -> io::Result<Self> {
+    fn new(files: Vec<File>, nr: usize) -> io::Result<Self> {
         let ring = IoUring::new(nr as u32)?;
         let fds = files
             .iter()
@@ -156,14 +163,10 @@ impl UringContextInner {
             poll_finish: None,
         })
     }
-}
 
-impl Drop for UringContextInner {
-    fn drop(&mut self) {
-        let handle = self.handle.take().unwrap();
-        let poll_finish = self.poll_finish.take().unwrap();
+    async fn flush(&self) -> io::Result<()> {
         let nop_op = opcode::Nop::new();
-        let (tx, mut rx) = channel();
+        let (tx, rx) = channel();
         let mut task = Box::pin(UringTask { complete: Some(tx) });
         let entry = nop_op
             .build()
@@ -175,12 +178,24 @@ impl Drop for UringContextInner {
             res = unsafe { self.ring.submission().push(entry) };
         }
 
-        loop {
-            match rx.try_recv() {
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Closed) | Ok(_) => break,
-            }
-        }
+        rx.await
+            .map_err(|_| io::Error::new(ErrorKind::Other, "failed to recv"))
+            .and_then(|code| {
+                if code == 0 {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(ErrorKind::Other, "failed to recv"))
+                }
+            })?;
+
+        Ok(())
+    }
+}
+
+impl Drop for UringContextInner {
+    fn drop(&mut self) {
+        let handle = self.handle.take().unwrap();
+        let poll_finish = self.poll_finish.take().unwrap();
 
         poll_finish.send(()).unwrap();
 
@@ -212,7 +227,18 @@ impl UringContext {
     where
         T: AsMut<[u8]>,
     {
-        UringReadFuture::new(self.inner.clone(), buf, id, offset)
+        UringReadFuture::new(self.inner.clone(), buf, id, offset, false)
+    }
+
+    pub fn read_submit<'a, T>(&self, id: u32, offset: u64, buf: T) -> UringReadFuture<T>
+    where
+        T: AsMut<[u8]>,
+    {
+        UringReadFuture::new(self.inner.clone(), buf, id, offset, true)
+    }
+
+    pub async fn flush(&self) -> io::Result<()> {
+        self.inner.flush().await
     }
 }
 
@@ -222,7 +248,7 @@ mod tests {
     use std::io::Write;
     use tempfile::tempfile;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn test_new() {
         let files = (0..25)
             .map(|_| {
@@ -234,8 +260,8 @@ mod tests {
         let _context = UringContext::new(files, 256).unwrap();
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_read() {
+    #[tokio::test]
+    async fn test_read_and_flush() {
         let files = (0..4)
             .map(|_| {
                 let mut file = tempfile().unwrap();
@@ -254,5 +280,6 @@ mod tests {
             let (_, sz) = context.read(i, 0, &mut buf).await.unwrap();
             assert_eq!(&buf[..sz], b"test");
         }
+        context.flush().await.unwrap();
     }
 }
