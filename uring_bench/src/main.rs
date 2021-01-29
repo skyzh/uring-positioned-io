@@ -219,7 +219,7 @@ async fn main() -> io::Result<()> {
         "write_waterfall.png".to_owned(),
     ));
 
-    let mut sender = receiver.get_sender();
+    let sender = receiver.get_sender();
 
     // spawn reporter thread
     let clocksource_ = receiver.get_clocksource();
@@ -247,18 +247,13 @@ async fn main() -> io::Result<()> {
                     .truncate(true)
                     .create(true)
                     .open(dir.join(format!("{}.blk", id)))?;
-                let mut writer = BufWriter::new(f);
+                let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, f); // 4M buffer
                 for block in 0..nb {
                     let val = gen_hash(id, block);
                     let mut buf = vec![];
                     buf.put_u64(val);
                     for _ in 0..(4096 / buf.len()) {
-                        let start = clocksource.counter();
                         writer.write(&buf)?;
-                        let stop = clocksource.counter();
-                        sender
-                            .send(Sample::new(start, stop, Metric::BlockOp))
-                            .unwrap();
                     }
                 }
             }
@@ -374,11 +369,9 @@ async fn main() -> io::Result<()> {
                     loop {
                         let (fid, blkid) = (rng.gen_range(0..nf), rng.gen_range(0..nb));
                         let start = clocksource.counter();
-                        verify_buf(
-                            &mmap_files[fid][(blkid * 4096)..((blkid + 1) * 4096)],
-                            fid,
-                            blkid,
-                        );
+                        let mut buf = vec![0; 4096];
+                        buf.copy_from_slice(&mmap_files[fid][(blkid * 4096)..((blkid + 1) * 4096)]);
+                        verify_buf(&buf, fid, blkid);
                         let stop = clocksource.counter();
                         sender
                             .send(Sample::new(start, stop, Metric::BlockOp))
