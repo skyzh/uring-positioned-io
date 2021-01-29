@@ -40,6 +40,20 @@ impl std::fmt::Display for Metric {
     }
 }
 
+unsafe fn madvise_rand(ptr: *const u8, len: usize) -> io::Result<()> {
+    let result = libc::madvise(
+        ptr as *mut libc::c_void,
+        len,
+        libc::MADV_RANDOM as libc::c_int,
+    );
+
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn report(
     receiver: &mut Receiver<Metric>,
     clocksource: &Clocksource,
@@ -334,8 +348,15 @@ async fn main() -> io::Result<()> {
                 files
                     .iter()
                     .map(|f| unsafe { memmap::Mmap::map(f) })
-                    .collect::<io::Result<Vec<_>>>()?,
+                    .collect::<io::Result<Vec<_>>>()
+                    .unwrap(),
             );
+
+            for mmap_file in &*mmap_files {
+                unsafe {
+                    madvise_rand(mmap_file.as_ptr(), mmap_file.len()).unwrap();
+                }
+            }
 
             let (tx, rx) = crossbeam_channel::unbounded();
 

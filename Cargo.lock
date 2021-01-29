@@ -1207,6 +1207,7 @@ dependencies = [
  "crossbeam-channel",
  "env_logger",
  "futures",
+ "libc",
  "log 0.4.14",
  "memmap",
  "rand 0.8.3",
