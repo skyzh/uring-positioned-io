@@ -52,7 +52,7 @@ impl Future for UringPollFuture {
 
 #[pin_project]
 pub struct UringReadFuture<T: AsMut<[u8]>> {
-    ctx: Arc<UringContextInner>,
+    ring: Arc<io_uring::concurrent::IoUring>,
     buf: Option<T>,
     id: u32,
     offset: u64,
@@ -65,11 +65,17 @@ pub struct UringReadFuture<T: AsMut<[u8]>> {
 }
 
 impl<T: AsMut<[u8]>> UringReadFuture<T> {
-    fn new(ctx: Arc<UringContextInner>, buf: T, id: u32, offset: u64, per_submit: bool) -> Self {
+    fn new(
+        ring: Arc<io_uring::concurrent::IoUring>,
+        buf: T,
+        id: u32,
+        offset: u64,
+        per_submit: bool,
+    ) -> Self {
         let (tx, rx) = channel();
         let task = UringTask { complete: Some(tx) };
         Self {
-            ctx,
+            ring,
             buf: Some(buf),
             id,
             offset,
@@ -90,14 +96,14 @@ impl<T: AsMut<[u8]>> UringReadFuture<T> {
             let entry = read_op
                 .build()
                 .user_data(this.task.get_mut() as *mut _ as u64);
-            if let Err(_) = unsafe { this.ctx.ring.submission().push(entry) } {
+            if let Err(_) = unsafe { this.ring.submission().push(entry) } {
                 cx.waker().wake_by_ref();
                 return Poll::Pending;
             }
             *this.submitted = true;
 
             if *this.per_submit {
-                if let Err(err) = this.ctx.ring.submit() {
+                if let Err(err) = this.ring.submit() {
                     return Poll::Ready(Err(err));
                 }
             }
@@ -227,14 +233,14 @@ impl UringContext {
     where
         T: AsMut<[u8]>,
     {
-        UringReadFuture::new(self.inner.clone(), buf, id, offset, false)
+        UringReadFuture::new(self.inner.ring.clone(), buf, id, offset, false)
     }
 
     pub fn read_submit<'a, T>(&self, id: u32, offset: u64, buf: T) -> UringReadFuture<T>
     where
         T: AsMut<[u8]>,
     {
-        UringReadFuture::new(self.inner.clone(), buf, id, offset, true)
+        UringReadFuture::new(self.inner.ring.clone(), buf, id, offset, true)
     }
 
     pub async fn flush(&self) -> io::Result<()> {

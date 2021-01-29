@@ -86,8 +86,7 @@ fn report(
     );
 }
 
-#[tokio::main]
-async fn main() -> io::Result<()> {
+async fn run() -> io::Result<()> {
     let matches = App::new("uring")
         .about("A benchmark utility for io_uring")
         .version("1.0")
@@ -227,7 +226,7 @@ async fn main() -> io::Result<()> {
     let (report_tx, rx) = std::sync::mpsc::channel();
     let handle = std::thread::spawn(move || {
         let mut total = 0;
-        for _ in 0..rx.recv().unwrap() {
+        for _ in 0..rx.recv().unwrap_or(0) {
             report(&mut receiver, &clocksource, Metric::BlockOp, &mut total);
         }
         info!("saving files...");
@@ -270,15 +269,16 @@ async fn main() -> io::Result<()> {
             let files = (0..nf)
                 .map(|id| dir.join(format!("{}.blk", id)))
                 .map(|name| File::open(name))
-                .collect::<io::Result<Vec<_>>>()?;
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap();
 
             let (tx, mut rx) = channel();
             let mut tx = Some(tx);
 
-            let ctx = UringRandomAccessFiles::new(files, ql)?;
+            let ctx = UringRandomAccessFiles::new(files, ql).unwrap();
 
             let pos_stream = stream! {
-                let mut rng = thread_rng();
+                let mut rng = rand::rngs::SmallRng::from_entropy();
                 loop {
                     let pos = (rng.gen_range(0..nf), rng.gen_range(0..nb));
                     yield pos;
@@ -299,7 +299,7 @@ async fn main() -> io::Result<()> {
                     let clocksource = clocksource.clone();
                     let mut sender = sender.clone();
                     async move {
-                        let mut buf = [0; 4096];
+                        let mut buf = vec![0; 4096];
                         let start = clocksource.counter();
                         let size = ctx.read(fid as u32, blkid as u64 * 4096, &mut buf).await?;
                         assert_eq!(size, 4096);
@@ -338,7 +338,8 @@ async fn main() -> io::Result<()> {
             let files = (0..nf)
                 .map(|id| dir.join(format!("{}.blk", id)))
                 .map(|name| File::open(name))
-                .collect::<io::Result<Vec<_>>>()?;
+                .collect::<io::Result<Vec<_>>>()
+                .unwrap();
             let mmap_files = std::sync::Arc::new(
                 files
                     .iter()
@@ -364,7 +365,7 @@ async fn main() -> io::Result<()> {
                 let clocksource = clocksource.clone();
                 let mut sender = sender.clone();
                 std::thread::spawn(move || {
-                    let mut rng = thread_rng();
+                    let mut rng = rand::rngs::SmallRng::from_entropy();
                     let mut cnt = 0;
                     loop {
                         let (fid, blkid) = (rng.gen_range(0..nf), rng.gen_range(0..nb));
@@ -396,4 +397,12 @@ async fn main() -> io::Result<()> {
 
     handle.join().unwrap();
     Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let mut runtime = tokio::runtime::Builder::new_multi_thread();
+    // runtime.worker_threads(4);
+    runtime.enable_all();
+    let runtime = runtime.build().unwrap();
+    runtime.block_on(run())
 }
