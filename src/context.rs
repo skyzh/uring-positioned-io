@@ -222,7 +222,7 @@ mod tests {
     use std::io::Write;
     use tempfile::tempfile;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_new() {
         let files = (0..25)
             .map(|_| {
@@ -234,7 +234,7 @@ mod tests {
         let _context = UringContext::new(files, 256).unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_read() {
         let files = (0..4)
             .map(|_| {
