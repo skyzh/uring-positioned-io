@@ -1,3 +1,4 @@
+use crossbeam_channel::unbounded;
 use io::ErrorKind;
 use io_uring::{opcode, types::Fixed, IoUring};
 use pin_project::pin_project;
@@ -8,7 +9,7 @@ use std::os::unix::io::AsRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use tokio::sync::oneshot::{channel, error::TryRecvError, Receiver, Sender};
+use tokio::sync::oneshot::{channel, Receiver, Sender};
 
 struct UringTask {
     complete: Option<Sender<i32>>,
@@ -16,12 +17,19 @@ struct UringTask {
 
 struct UringPollFuture {
     ring: Arc<io_uring::concurrent::IoUring>,
-    finish: Receiver<()>,
+    finish: crossbeam_channel::Receiver<()>,
 }
 
 impl Future for UringPollFuture {
     type Output = io::Result<()>;
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.finish.try_recv() {
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+            Err(crossbeam_channel::TryRecvError::Disconnected) | Ok(_) => {
+                return Poll::Ready(Ok(()))
+            }
+        }
+
         // first, submit all requests
         if let Err(err) = self.ring.submit() {
             return Poll::Ready(Err(err));
@@ -29,11 +37,6 @@ impl Future for UringPollFuture {
 
         // then, polling completed requests
         loop {
-            match self.finish.try_recv() {
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Closed) | Ok(_) => return Poll::Ready(Ok(())),
-            }
-
             if let Some(entry) = self.ring.completion().pop() {
                 let uring_task: &mut UringTask = unsafe { std::mem::transmute(entry.user_data()) };
                 uring_task
@@ -147,14 +150,20 @@ impl<T: AsMut<[u8]>> Future for UringReadFuture<T> {
 }
 
 struct UringContextInner {
-    handle: Option<tokio::task::JoinHandle<io::Result<()>>>,
+    handles: Vec<tokio::task::JoinHandle<io::Result<()>>>,
     ring: Arc<io_uring::concurrent::IoUring>,
-    poll_finish: Option<Sender<()>>,
+    poll_finish: Option<crossbeam_channel::Sender<()>>,
     _files: Vec<File>,
 }
 
 impl UringContextInner {
     fn new(files: Vec<File>, nr: usize) -> io::Result<Self> {
+        let mut this = Self::new_ref(&files, nr)?;
+        this._files = files;
+        Ok(this)
+    }
+
+    fn new_ref(files: &[File], nr: usize) -> io::Result<Self> {
         let ring = IoUring::new(nr as u32)?;
         let fds = files
             .iter()
@@ -163,9 +172,9 @@ impl UringContextInner {
         ring.submitter().register_files(&fds)?;
         let ring = Arc::new(ring.concurrent());
         Ok(Self {
-            _files: files,
+            _files: vec![],
             ring,
-            handle: None,
+            handles: vec![],
             poll_finish: None,
         })
     }
@@ -200,12 +209,11 @@ impl UringContextInner {
 
 impl Drop for UringContextInner {
     fn drop(&mut self) {
-        let handle = self.handle.take().unwrap();
-        let poll_finish = self.poll_finish.take().unwrap();
+        self.poll_finish.take().unwrap();
 
-        poll_finish.send(()).unwrap();
-
-        handle.abort();
+        for handle in self.handles.drain(..) {
+            handle.abort();
+        }
     }
 }
 
@@ -215,15 +223,28 @@ pub struct UringContext {
 }
 
 impl UringContext {
-    pub fn new(files: Vec<File>, nr: usize) -> io::Result<Self> {
-        let (tx, rx) = channel();
-        let mut inner = UringContextInner::new(files, nr)?;
+    pub fn new(files: Vec<File>, nr: usize, poll: usize) -> io::Result<Self> {
+        let inner = UringContextInner::new(files, nr)?;
+        Self::from_inner(inner, poll)
+    }
+
+    pub unsafe fn new_ref(files: &[File], nr: usize, poll: usize) -> io::Result<Self> {
+        let inner = UringContextInner::new_ref(files, nr)?;
+        Self::from_inner(inner, poll)
+    }
+
+    fn from_inner(mut inner: UringContextInner, poll: usize) -> io::Result<Self> {
+        let (tx, rx) = unbounded();
         inner.poll_finish = Some(tx);
-        let handle = tokio::spawn(UringPollFuture {
-            ring: inner.ring.clone(),
-            finish: rx,
-        });
-        inner.handle = Some(handle);
+        let handles = (0..poll)
+            .map(|_| {
+                tokio::spawn(UringPollFuture {
+                    ring: inner.ring.clone(),
+                    finish: rx.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        inner.handles = handles;
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -263,7 +284,7 @@ mod tests {
                 file
             })
             .collect::<Vec<_>>();
-        let _context = UringContext::new(files, 256).unwrap();
+        let _context = UringContext::new(files, 256, 1).unwrap();
     }
 
     #[tokio::test]
@@ -276,7 +297,7 @@ mod tests {
                 file
             })
             .collect::<Vec<_>>();
-        let context = UringContext::new(files, 256).unwrap();
+        let context = UringContext::new(files, 256, 1).unwrap();
         let mut buf = vec![0; 4];
         for i in 0..4 {
             let (_, sz) = context.read(i, 0, &mut buf).await.unwrap();

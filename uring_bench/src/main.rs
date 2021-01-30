@@ -1,12 +1,12 @@
 use bytes::{Buf, BufMut};
-use std::{collections::hash_map::DefaultHasher, time::Instant};
+use std::collections::hash_map::DefaultHasher;
+use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
+use std::sync::Arc;
 use std::{fs::File, hash::Hasher, io, path::Path};
-use tokio::sync::oneshot::channel;
 use uring_positioned_io::{RandomAccessFiles, UringRandomAccessFiles};
 
-use async_stream::stream;
 use clap::{App, Arg, SubCommand};
-use futures::{pin_mut, stream::*};
 use io::{BufWriter, Write};
 use rand::prelude::*;
 use tic::{Clocksource, Interest, Percentile, Receiver, Sample};
@@ -23,9 +23,10 @@ fn gen_hash(id: usize, block: usize) -> u64 {
 
 fn verify_buf(mut buf: &[u8], id: usize, block: usize) {
     assert_eq!(buf.len(), 4096);
-    let val = gen_hash(id, block);
+    let mut val = gen_hash(id, block);
     while buf.len() > 0 {
         assert_eq!(buf.get_u64(), val);
+        val = val.wrapping_add(48892056947);
     }
 }
 
@@ -85,6 +86,9 @@ fn report(
             .unwrap_or(&0)
     );
 }
+
+#[repr(align(4096))]
+struct Page([u8; 4096]);
 
 async fn run() -> io::Result<()> {
     let matches = App::new("uring")
@@ -155,11 +159,16 @@ async fn run() -> io::Result<()> {
                         .required(true),
                 )
                 .arg(
-                    Arg::with_name("con")
-                        .long("con")
+                    Arg::with_name("concurrent")
+                        .long("concurrent")
                         .takes_value(true)
                         .help("concurrent tasks")
                         .required(true),
+                )
+                .arg(
+                    Arg::with_name("direct")
+                        .long("direct")
+                        .help("enable direct I/O"),
                 ),
         )
         .subcommand(
@@ -217,6 +226,10 @@ async fn run() -> io::Result<()> {
         Metric::BlockOp,
         "write_waterfall.png".to_owned(),
     ));
+    receiver.add_interest(Interest::LatencyTrace(
+        Metric::BlockOp,
+        "write_trace.txt".to_owned(),
+    ));
 
     let sender = receiver.get_sender();
 
@@ -248,11 +261,14 @@ async fn run() -> io::Result<()> {
                     .open(dir.join(format!("{}.blk", id)))?;
                 let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, f); // 4M buffer
                 for block in 0..nb {
-                    let val = gen_hash(id, block);
+                    let mut val = gen_hash(id, block);
                     let mut buf = vec![];
                     buf.put_u64(val);
                     for _ in 0..(4096 / buf.len()) {
+                        buf.clear();
+                        buf.put_u64(val);
                         writer.write(&buf)?;
+                        val = val.wrapping_add(48892056947);
                     }
                 }
             }
@@ -265,69 +281,69 @@ async fn run() -> io::Result<()> {
             let dir = Path::new(sub_matches.value_of("dir").unwrap());
             let duration: u64 = sub_matches.value_of("duration").unwrap().parse().unwrap();
             let ql: usize = sub_matches.value_of("ql").unwrap().parse().unwrap();
-            let con: usize = sub_matches.value_of("con").unwrap().parse().unwrap();
+            let concurrent: usize = sub_matches.value_of("concurrent").unwrap().parse().unwrap();
+            let direct = sub_matches.is_present("direct");
+            if direct {
+                info!("direct I/O enabled");
+            }
+
             let files = (0..nf)
                 .map(|id| dir.join(format!("{}.blk", id)))
-                .map(|name| File::open(name))
+                .map(|name| {
+                    if direct {
+                        OpenOptions::new()
+                            .read(true)
+                            .custom_flags(libc::O_DIRECT)
+                            .open(name)
+                    } else {
+                        File::open(name)
+                    }
+                })
                 .collect::<io::Result<Vec<_>>>()
                 .unwrap();
 
-            let (tx, mut rx) = channel();
-            let mut tx = Some(tx);
-
             let ctx = UringRandomAccessFiles::new(files, ql).unwrap();
 
-            let pos_stream = stream! {
-                let mut rng = rand::rngs::SmallRng::from_entropy();
-                loop {
-                    let pos = (rng.gen_range(0..nf), rng.gen_range(0..nb));
-                    yield pos;
-                    if let Ok(()) = rx.try_recv() {
-                        break;
-                    }
-                }
-            };
+            let (tx, rx) = crossbeam_channel::unbounded::<()>();
 
             info!("begin running");
             report_tx.send(duration).unwrap();
 
-            pin_mut!(pos_stream);
+            for _i in 0..concurrent {
+                let ctx = ctx.clone();
+                let rx = rx.clone();
+                let clocksource = clocksource.clone();
+                let mut sender = sender.clone();
+                tokio::spawn(async move {
+                    let mut rng = rand::rngs::SmallRng::from_entropy();
 
-            let mut stream = pos_stream
-                .map(|(fid, blkid)| {
-                    let ctx = ctx.clone();
-                    let clocksource = clocksource.clone();
-                    let mut sender = sender.clone();
-                    async move {
-                        let mut buf = vec![0; 4096];
+                    loop {
+                        let (fid, blkid) = (rng.gen_range(0..nf), rng.gen_range(0..nb));
                         let start = clocksource.counter();
-                        let size = ctx.read(fid as u32, blkid as u64 * 4096, &mut buf).await?;
-                        assert_eq!(size, 4096);
-                        verify_buf(&buf, fid, blkid);
+                        let mut buf = Box::new(Page([0 as u8; 4096]));
+                        let n = ctx
+                            .read(fid as u32, blkid as u64 * 4096, &mut (*buf).0)
+                            .await?;
+                        assert_eq!(n, 4096);
+                        verify_buf(&(*buf).0, fid, blkid);
                         let stop = clocksource.counter();
                         sender
                             .send(Sample::new(start, stop, Metric::BlockOp))
                             .unwrap();
-                        Ok::<(), io::Error>(())
-                    }
-                })
-                .buffer_unordered(con);
 
-            let start = Instant::now();
-            let mut cnt: usize = 0;
-
-            while let Some(result) = stream.next().await {
-                result?;
-                cnt += 1;
-                if cnt % 10000 == 0 {
-                    let elsped = Instant::now().duration_since(start).as_secs_f64();
-                    if elsped >= duration as f64 {
-                        if let Some(tx) = tx.take() {
-                            tx.send(()).unwrap();
-                        };
+                        if matches!(
+                            rx.try_recv(),
+                            Err(crossbeam_channel::TryRecvError::Disconnected)
+                        ) {
+                            break;
+                        }
                     }
-                }
+                    Ok::<(), io::Error>(())
+                });
             }
+            tokio::time::sleep(std::time::Duration::from_secs(duration)).await;
+            drop(tx);
+            ctx.flush().await.unwrap();
         }
         ("read_mmap", Some(sub_matches)) => {
             let nf: usize = sub_matches.value_of("nf").unwrap().parse().unwrap();
@@ -340,7 +356,7 @@ async fn run() -> io::Result<()> {
                 .map(|name| File::open(name))
                 .collect::<io::Result<Vec<_>>>()
                 .unwrap();
-            let mmap_files = std::sync::Arc::new(
+            let mmap_files = Arc::new(
                 files
                     .iter()
                     .map(|f| unsafe { memmap::Mmap::map(f) })
@@ -354,7 +370,7 @@ async fn run() -> io::Result<()> {
                 }
             }
 
-            let (tx, rx) = crossbeam_channel::unbounded();
+            let (tx, rx) = crossbeam_channel::unbounded::<()>();
 
             info!("begin running");
             report_tx.send(duration).unwrap();
@@ -366,31 +382,31 @@ async fn run() -> io::Result<()> {
                 let mut sender = sender.clone();
                 std::thread::spawn(move || {
                     let mut rng = rand::rngs::SmallRng::from_entropy();
-                    let mut cnt = 0;
+
                     loop {
                         let (fid, blkid) = (rng.gen_range(0..nf), rng.gen_range(0..nb));
                         let start = clocksource.counter();
-                        let mut buf = vec![0; 4096];
-                        buf.copy_from_slice(&mmap_files[fid][(blkid * 4096)..((blkid + 1) * 4096)]);
-                        verify_buf(&buf, fid, blkid);
+                        let mut buf = Box::new(Page([0 as u8; 4096]));
+                        buf.0.copy_from_slice(
+                            &mmap_files[fid][(blkid * 4096)..((blkid + 1) * 4096)],
+                        );
+                        verify_buf(&(*buf).0, fid, blkid);
                         let stop = clocksource.counter();
                         sender
                             .send(Sample::new(start, stop, Metric::BlockOp))
                             .unwrap();
-                        cnt += 1;
-                        if cnt % 10000 == 0 {
-                            if matches!(
-                                rx.try_recv(),
-                                Err(crossbeam_channel::TryRecvError::Disconnected)
-                            ) {
-                                break;
-                            }
+
+                        if matches!(
+                            rx.try_recv(),
+                            Err(crossbeam_channel::TryRecvError::Disconnected)
+                        ) {
+                            break;
                         }
                     }
                 });
             }
             std::thread::sleep(std::time::Duration::from_secs(duration));
-            tx.send(()).unwrap();
+            drop(tx);
         }
         _ => panic!("unsupported command"),
     }
@@ -401,7 +417,6 @@ async fn run() -> io::Result<()> {
 
 fn main() -> io::Result<()> {
     let mut runtime = tokio::runtime::Builder::new_multi_thread();
-    // runtime.worker_threads(4);
     runtime.enable_all();
     let runtime = runtime.build().unwrap();
     runtime.block_on(run())

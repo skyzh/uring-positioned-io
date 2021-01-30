@@ -47,27 +47,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ae7d751998c189c1d4468cf0a39bb2eae052a9c58d50ebb3b9591ee3813ad50"
 
 [[package]]
-name = "async-stream"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3670df70cbc01729f901f94c887814b3c68db038aad1329a418bae178bc5295c"
-dependencies = [
- "async-stream-impl",
- "futures-core",
-]
-
-[[package]]
-name = "async-stream-impl"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3548b8efc9f8e8a5a0a2808c5bd8451a9031b9e5b879a79590304ae928b0a70"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.42"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1189,6 +1168,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "crossbeam-channel",
  "futures-core",
  "io-uring",
  "pin-project",
@@ -1201,7 +1181,6 @@ dependencies = [
 name = "uring_bench"
 version = "0.1.0"
 dependencies = [
- "async-stream",
  "bytes",
  "clap",
  "crossbeam-channel",
