@@ -157,14 +157,20 @@ struct UringContextInner {
 }
 
 impl UringContextInner {
-    fn new(files: Vec<File>, nr: usize) -> io::Result<Self> {
-        let mut this = Self::new_ref(&files, nr)?;
+    fn new(files: Vec<File>, nr: usize, kernel_poll: bool) -> io::Result<Self> {
+        let mut this = Self::new_ref(&files, nr, kernel_poll)?;
         this._files = files;
         Ok(this)
     }
 
-    fn new_ref(files: &[File], nr: usize) -> io::Result<Self> {
-        let ring = IoUring::new(nr as u32)?;
+    fn new_ref(files: &[File], nr: usize, kernel_poll: bool) -> io::Result<Self> {
+        let ring = if kernel_poll {
+            io_uring::Builder::default()
+                .setup_sqpoll(1)
+                .build(nr as u32)?
+        } else {
+            IoUring::new(nr as u32)?
+        };
         let fds = files
             .iter()
             .map(|file| file.as_raw_fd())
@@ -223,13 +229,8 @@ pub struct UringContext {
 }
 
 impl UringContext {
-    pub fn new(files: Vec<File>, nr: usize, poll: usize) -> io::Result<Self> {
-        let inner = UringContextInner::new(files, nr)?;
-        Self::from_inner(inner, poll)
-    }
-
-    pub unsafe fn new_ref(files: &[File], nr: usize, poll: usize) -> io::Result<Self> {
-        let inner = UringContextInner::new_ref(files, nr)?;
+    pub fn new(files: Vec<File>, nr: usize, poll: usize, kernel_poll: bool) -> io::Result<Self> {
+        let inner = UringContextInner::new(files, nr, kernel_poll)?;
         Self::from_inner(inner, poll)
     }
 
@@ -284,7 +285,7 @@ mod tests {
                 file
             })
             .collect::<Vec<_>>();
-        let _context = UringContext::new(files, 256, 1).unwrap();
+        let _context = UringContext::new(files, 256, 1, false).unwrap();
     }
 
     #[tokio::test]
@@ -297,7 +298,7 @@ mod tests {
                 file
             })
             .collect::<Vec<_>>();
-        let context = UringContext::new(files, 256, 1).unwrap();
+        let context = UringContext::new(files, 256, 1, false).unwrap();
         let mut buf = vec![0; 4];
         for i in 0..4 {
             let (_, sz) = context.read(i, 0, &mut buf).await.unwrap();

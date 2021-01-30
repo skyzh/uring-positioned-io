@@ -4,7 +4,7 @@ use std::fs::OpenOptions;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::Arc;
 use std::{fs::File, hash::Hasher, io, path::Path};
-use uring_positioned_io::{RandomAccessFiles, UringRandomAccessFiles};
+use uring_positioned_io::UringRandomAccessFiles;
 
 use clap::{App, Arg, SubCommand};
 use io::{BufWriter, Write};
@@ -166,9 +166,9 @@ async fn run() -> io::Result<()> {
                         .required(true),
                 )
                 .arg(
-                    Arg::with_name("direct")
-                        .long("direct")
-                        .help("enable direct I/O"),
+                    Arg::with_name("kernel")
+                        .long("kernel")
+                        .help("enable kernel polling"),
                 ),
         )
         .subcommand(
@@ -282,10 +282,11 @@ async fn run() -> io::Result<()> {
             let duration: u64 = sub_matches.value_of("duration").unwrap().parse().unwrap();
             let ql: usize = sub_matches.value_of("ql").unwrap().parse().unwrap();
             let concurrent: usize = sub_matches.value_of("concurrent").unwrap().parse().unwrap();
-            let direct = sub_matches.is_present("direct");
-            if direct {
-                info!("direct I/O enabled");
+            let kernel_poll = sub_matches.is_present("kernel");
+            if kernel_poll {
+                info!("kernel polling enabled");
             }
+            let direct = false;
 
             let files = (0..nf)
                 .map(|id| dir.join(format!("{}.blk", id)))
@@ -302,7 +303,13 @@ async fn run() -> io::Result<()> {
                 .collect::<io::Result<Vec<_>>>()
                 .unwrap();
 
-            let ctx = UringRandomAccessFiles::new(files, ql).unwrap();
+            let ctx = UringRandomAccessFiles::new(
+                files,
+                ql,
+                if kernel_poll { 1 } else { 4 },
+                kernel_poll,
+            )
+            .unwrap();
 
             let (tx, rx) = crossbeam_channel::unbounded::<()>();
 
