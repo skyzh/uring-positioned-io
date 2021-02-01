@@ -2,3 +2,4 @@
 *.png
 *.txt
 perf.*
+Cargo.lock
