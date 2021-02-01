@@ -30,8 +30,8 @@ cargo run -p uring_bench --release generate --nf 128 --nb 262144 --dir ~/Work/ur
 Then, benchmark with `io_uring`. Benchmark script will read 4K block and verify it.
 
 ```bash
-RUST_LOG=info cargo run --release -- read --nf 128 --nb 262144 --dir ~/Work/uring_bench --duration 60 --concurrent 32 --ql 512
-RUST_LOG=info cargo run --release -- read --nf 128 --nb 262144 --dir ~/Work/uring_bench --duration 60 --concurrent 512 --ql 512
+RUST_LOG=info cargo run -p uring_bench --release -- read --nf 128 --nb 262144 --dir ~/Work/uring_bench --duration 60 --concurrent 32 --ql 512
+RUST_LOG=info cargo run -p uring_bench --release -- read --nf 128 --nb 262144 --dir ~/Work/uring_bench --duration 60 --concurrent 512 --ql 512
 ```
 
 Finally, compare `io_uring` with `mmap` by benchmarking.

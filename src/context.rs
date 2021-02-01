@@ -11,10 +11,15 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::oneshot::{channel, Receiver, Sender};
 
+/// `UringTask` contains a oneshot sender. `UringTask` should be pinned
+/// in memory, with its address passed to io_uring as user data. On completion,
+/// the polling future will extract `UringTask` from user data and notify
+/// `UringReadFuture`.
 struct UringTask {
     complete: Option<Sender<i32>>,
 }
 
+/// `UringPollFuture` batch submits and polls tasks in `io_uring`.
 struct UringPollFuture {
     ring: Arc<io_uring::concurrent::IoUring>,
     finish: crossbeam_channel::Receiver<()>,
@@ -53,6 +58,7 @@ impl Future for UringPollFuture {
     }
 }
 
+/// `UringReadFuture` manages a full cycle of a read file task.
 #[pin_project]
 pub struct UringReadFuture<T: AsMut<[u8]>> {
     ring: Arc<io_uring::concurrent::IoUring>,
@@ -223,12 +229,18 @@ impl Drop for UringContextInner {
     }
 }
 
+/// `UringContext` manages an `io_uring` object.
 #[derive(Clone)]
 pub struct UringContext {
     inner: Arc<UringContextInner>,
 }
 
 impl UringContext {
+    /// Create a context from given files and parameters.
+    ///
+    /// * `nr`: submission and completion queue size.
+    /// * `poll`: number of poll futures. Set it to `2-4` yields best performance.
+    /// * `kernel_poll`: enable kernel polling. Requires root. If this is enabled, set `poll` to 1.
     pub fn new(files: Vec<File>, nr: usize, poll: usize, kernel_poll: bool) -> io::Result<Self> {
         let inner = UringContextInner::new(files, nr, kernel_poll)?;
         Self::from_inner(inner, poll)
@@ -251,6 +263,10 @@ impl UringContext {
         })
     }
 
+    /// read <id, offset> to buf with `io_uring`.
+    ///
+    /// `id` corresponds to the position of file in `Vec<File>` when creating context.
+    /// This function will return `(buf, bytes_read)`.
     pub fn read<'a, T>(&self, id: u32, offset: u64, buf: T) -> UringReadFuture<T>
     where
         T: AsMut<[u8]>,
@@ -258,6 +274,7 @@ impl UringContext {
         UringReadFuture::new(self.inner.ring.clone(), buf, id, offset, false)
     }
 
+    /// Equivalent to `read`, except that the task is immediately submitted to queue.
     pub fn read_submit<'a, T>(&self, id: u32, offset: u64, buf: T) -> UringReadFuture<T>
     where
         T: AsMut<[u8]>,
@@ -265,6 +282,7 @@ impl UringContext {
         UringReadFuture::new(self.inner.ring.clone(), buf, id, offset, true)
     }
 
+    /// Send a `nop` to `io_uring` to drain the queue.
     pub async fn flush(&self) -> io::Result<()> {
         self.inner.flush().await
     }
