@@ -303,11 +303,11 @@ mod tests {
                 file
             })
             .collect::<Vec<_>>();
-        let _context = UringContext::new(files, 256, 1, false).unwrap();
+        let _context = UringContext::new(files, 4, 1, false).unwrap();
     }
 
     #[tokio::test]
-    async fn test_read_and_flush() {
+    async fn test_read() {
         let files = (0..4)
             .map(|_| {
                 let mut file = tempfile().unwrap();
@@ -316,7 +316,7 @@ mod tests {
                 file
             })
             .collect::<Vec<_>>();
-        let context = UringContext::new(files, 256, 1, false).unwrap();
+        let context = UringContext::new(files, 4, 1, false).unwrap();
         let mut buf = vec![0; 4];
         for i in 0..4 {
             let (_, sz) = context.read(i, 0, &mut buf).await.unwrap();
@@ -326,6 +326,19 @@ mod tests {
             let (_, sz) = context.read(i, 0, &mut buf).await.unwrap();
             assert_eq!(&buf[..sz], b"test");
         }
+    }
+
+    #[tokio::test]
+    async fn test_flush() {
+        let files = (0..4)
+            .map(|_| {
+                let mut file = tempfile().unwrap();
+                write!(file, "test").unwrap();
+                file.flush().unwrap();
+                file
+            })
+            .collect::<Vec<_>>();
+        let context = UringContext::new(files, 4, 1, false).unwrap();
         context.flush().await.unwrap();
     }
 }
