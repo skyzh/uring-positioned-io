@@ -2,10 +2,21 @@
 
 Fully asynchronized positioned I/O with io_uring.
 
+## Basic Usage
+
+```rust
+let files = vec![File::open("test.txt").unwrap()];
+let context = UringContext::new(files, 256, 1, false).unwrap();
+let mut buf = vec![0; 4];
+let (_, sz) = context.read(0, 0, &mut buf).await.unwrap();
+assert_eq!(&buf[..sz], b"test");
+```
+
 ## Limitations
 
 Read buffer must be valid until a read is complete. This means that you must
-poll a read future until completion. You could not abort a read future.
+poll a read future until completion. You could not abort a read future. Later
+we may mark `read` as `unsafe`.
 
 ## Benchmark
 
